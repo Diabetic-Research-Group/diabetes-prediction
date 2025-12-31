@@ -1,0 +1,21 @@
+artifact_path: file:C:/Users/HP/Documents/Projects/[RESEARCH] Bio thingie/diabetes-prediction/mlruns/347893911080625868/models/m-e326341e26c746e4814de53ff278439e/artifacts
+flavors:
+  lightgbm:
+    code: null
+    data: model.pkl
+    lgb_version: 4.6.0
+    model_class: lightgbm.sklearn.LGBMClassifier
+  python_function:
+    data: model.pkl
+    env:
+      conda: conda.yaml
+      virtualenv: python_env.yaml
+    loader_module: mlflow.lightgbm
+    python_version: 3.13.6
+mlflow_version: 3.8.0
+model_id: m-e326341e26c746e4814de53ff278439e
+model_size_bytes: 5490233
+model_uuid: m-e326341e26c746e4814de53ff278439e
+prompts: null
+run_id: 55d50352453d47f88a641fbcd0e4ec9f
+utc_time_created: '2025-12-31 08:04:24.865671'
