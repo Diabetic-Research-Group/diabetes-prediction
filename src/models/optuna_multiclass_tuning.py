@@ -266,20 +266,17 @@ def cross_validate_model(
 
 
 def suggest_params(trial: optuna.Trial) -> Dict[str, float]:
+    """Suggest hyperparameters for LightGBM (restricted to 7 key parameters)."""
     params = {
         "objective": "multiclass",
         "num_class": 3,
         "n_estimators": trial.suggest_int("n_estimators", 200, 800),
         "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.2, log=True),
-        "num_leaves": trial.suggest_int("num_leaves", 16, 128),
         "max_depth": trial.suggest_int("max_depth", 3, 12),
+        "num_leaves": trial.suggest_int("num_leaves", 16, 128),
         "min_child_samples": trial.suggest_int("min_child_samples", 5, 50),
-        "subsample": trial.suggest_float("subsample", 0.6, 1.0),
-        "colsample_bytree": trial.suggest_float("colsample_bytree", 0.6, 1.0),
         "reg_alpha": trial.suggest_float("reg_alpha", 1e-8, 1.0, log=True),
         "reg_lambda": trial.suggest_float("reg_lambda", 1e-8, 1.0, log=True),
-        "min_split_gain": trial.suggest_float("min_split_gain", 0.0, 0.5),
-        "min_child_weight": trial.suggest_float("min_child_weight", 1e-3, 10.0, log=True),
         "n_jobs": -1,
         "random_state": RANDOM_STATE,
     }
@@ -326,10 +323,29 @@ def main():
         mlflow.log_dict(test_df[LABEL_COL].value_counts().to_dict(), "test_label_counts.json")
         mlflow.log_dict(train_df[AGG_COL].value_counts().to_dict(), "train_label_counts_agg.json")
         mlflow.log_dict(test_df[AGG_COL].value_counts().to_dict(), "test_label_counts_agg.json")
-        if os.path.exists(os.path.join("data", "diabetes_train.parquet")):
-            mlflow.log_artifact(os.path.join("data", "diabetes_train.parquet"), artifact_path="data")
-        if os.path.exists(os.path.join("data", "diabetes_test.parquet")):
-            mlflow.log_artifact(os.path.join("data", "diabetes_test.parquet"), artifact_path="data")
+        
+        # Log datasets as artifacts with error handling
+        train_path = os.path.join("data", "diabetes_train.parquet")
+        test_path = os.path.join("data", "diabetes_test.parquet")
+        if os.path.exists(train_path):
+            try:
+                mlflow.log_artifact(train_path, artifact_path="datasets")
+                mlflow.log_param("train_dataset_logged", "true")
+            except Exception as e:
+                print(f"[WARN] Failed to log train dataset: {e}")
+                mlflow.log_param("train_dataset_logged", "false")
+        else:
+            mlflow.log_param("train_dataset_logged", "file_not_found")
+            
+        if os.path.exists(test_path):
+            try:
+                mlflow.log_artifact(test_path, artifact_path="datasets")
+                mlflow.log_param("test_dataset_logged", "true")
+            except Exception as e:
+                print(f"[WARN] Failed to log test dataset: {e}")
+                mlflow.log_param("test_dataset_logged", "false")
+        else:
+            mlflow.log_param("test_dataset_logged", "file_not_found")
 
         study = optuna.create_study(direction="maximize")
         study.optimize(objective, n_trials=20)
