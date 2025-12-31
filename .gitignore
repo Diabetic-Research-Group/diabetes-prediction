@@ -208,3 +208,4 @@ __marimo__/
 
 # Mlflow
 mlruns/
+mlflow_tmp_arts/
