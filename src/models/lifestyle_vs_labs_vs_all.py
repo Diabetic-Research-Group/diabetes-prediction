@@ -9,20 +9,20 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-from datasets import load_dataset
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
     accuracy_score,
+    average_precision_score,
+    classification_report,
+    confusion_matrix,
     precision_recall_fscore_support,
     roc_auc_score,
-    average_precision_score,
-    confusion_matrix,
-    classification_report,
 )
 from lightgbm import LGBMClassifier
 
 import mlflow
 import mlflow.lightgbm
+
+from src.data.prepare_diabetes_data import AGG_COL, LABEL_COL, load_from_huggingface_or_local
 
 
 # 1. Blood / Serum laboratory measurements
@@ -101,68 +101,99 @@ all_features = (
     + med_history_comorbidities
 )
 
-label_col = "Diabetes_Type"  # ["T2D", "Possible-T2D", "T1D", "Not Diabetic", "Skipped", "Excluded"]
+CLASS_TO_ID = {"Not diabetic": 0, "T2D": 1, "Other": 2}
+ID_TO_CLASS = {v: k for k, v in CLASS_TO_ID.items()}
 
 
 def _select_existing_features(df: pd.DataFrame, features: List[str]) -> List[str]:
     return [c for c in features if c in df.columns]
 
 
-def _to_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+def _to_numeric(df: pd.DataFrame, cols: List[str], dataset_tag: str | None = None) -> pd.DataFrame:
     out = df[cols].copy()
+    invalid: Dict[str, Dict[str, object]] = {}
     for c in cols:
-        out[c] = pd.to_numeric(out[c], errors="coerce")
+        raw = out[c]
+        converted = pd.to_numeric(raw, errors="coerce")
+        bad_mask = converted.isna() & raw.notna()
+        bad_count = int(bad_mask.sum())
+        if bad_count > 0:
+            top_bad = raw[bad_mask].astype(str).value_counts().head(10).to_dict()
+            invalid[c] = {"invalid_count": bad_count, "top_values": top_bad}
+        out[c] = converted
+
+    if invalid:
+        target_name = dataset_tag or "dataset"
+        artifact_name = f"non_numeric_values_{target_name}.json"
+        try:
+            mlflow.log_dict(invalid, artifact_name)
+        except Exception:
+            print(f"[WARN] Non-numeric values encountered for {target_name}: {invalid}")
     return out
 
 
-def prepare_train_val(df: pd.DataFrame, label_col: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    df = df[df[label_col].notna()].copy()
-    # First split the full dataset into train/val 50/50 with stratification
-    train_full, val_df = train_test_split(
-        df, test_size=0.5, random_state=0, stratify=df[label_col]
-    )
-    # From train_full, filter to only T2D and Not diabetic (lowercase)
-    allowed = {"T2D", "Not diabetic"}
-    train_df = train_full[train_full[label_col].isin(allowed)].copy()
-    # Undersample Not diabetic to match T2D count
-    t2d_df = train_df[train_df[label_col] == "T2D"]
-    not_df = train_df[train_df[label_col] == "Not diabetic"]
-    n_t2d = len(t2d_df)
-    if len(not_df) > n_t2d:
-        not_df = not_df.sample(n=n_t2d, random_state=0)
-    train_bal = pd.concat([t2d_df, not_df], axis=0).sample(frac=1.0, random_state=0)
-    return train_bal, val_df
-
-
-def evaluate_and_log(
-    y_true_bin_val: np.ndarray,
-    y_pred_bin_val: np.ndarray,
-    y_proba_val: np.ndarray,
-    feature_group: str = "",
-) -> Dict[str, float]:
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_proba: np.ndarray) -> Tuple[Dict[str, float], np.ndarray]:
+    labels = [0, 1, 2]
     metrics: Dict[str, float] = {}
-    acc = float(accuracy_score(y_true_bin_val, y_pred_bin_val))
-    metrics["val_accuracy_bin"] = acc
-    print(f"  [{feature_group}] Binary Accuracy: {acc:.4f}, Unique preds: {np.unique(y_pred_bin_val)}, Unique true: {np.unique(y_true_bin_val)}")
-    pr, rc, f1, _ = precision_recall_fscore_support(
-        y_true_bin_val, y_pred_bin_val, average="binary", zero_division=0
+    metrics["accuracy"] = float(accuracy_score(y_true, y_pred))
+
+    pr_per_class, rc_per_class, f1_per_class, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=labels, average=None, zero_division=0
     )
-    metrics["val_precision_bin"] = float(pr)
-    metrics["val_recall_bin"] = float(rc)
-    metrics["val_f1_bin"] = float(f1)
-    # Log AUCs only if both classes are present in validation subset
-    if len(np.unique(y_true_bin_val)) == 2:
+    for cls_idx, pr_val in zip(labels, pr_per_class):
+        metrics[f"precision_class_{cls_idx}"] = float(pr_val)
+    for cls_idx, rc_val in zip(labels, rc_per_class):
+        metrics[f"recall_class_{cls_idx}"] = float(rc_val)
+    for cls_idx, f1_val in zip(labels, f1_per_class):
+        metrics[f"f1_class_{cls_idx}"] = float(f1_val)
+
+    pr_macro, rc_macro, f1_macro, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="macro", zero_division=0
+    )
+    pr_weighted, rc_weighted, f1_weighted, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="weighted", zero_division=0
+    )
+    metrics.update(
+        {
+            "precision_macro": float(pr_macro),
+            "recall_macro": float(rc_macro),
+            "f1_macro": float(f1_macro),
+            "precision_weighted": float(pr_weighted),
+            "recall_weighted": float(rc_weighted),
+            "f1_weighted": float(f1_weighted),
+        }
+    )
+
+    try:
+        metrics["roc_auc_macro"] = float(
+            roc_auc_score(y_true, y_proba, multi_class="ovr", average="macro")
+        )
+        metrics["roc_auc_weighted"] = float(
+            roc_auc_score(y_true, y_proba, multi_class="ovr", average="weighted")
+        )
+    except ValueError:
+        metrics["roc_auc_macro"] = 0.0
+        metrics["roc_auc_weighted"] = 0.0
+
+    pr_aucs = []
+    weighted_sum = 0.0
+    for cls_idx in labels:
+        y_true_bin = (y_true == cls_idx).astype(int)
         try:
-            metrics["val_roc_auc_bin"] = float(roc_auc_score(y_true_bin_val, y_proba_val))
-            metrics["val_pr_auc_bin"] = float(average_precision_score(y_true_bin_val, y_proba_val))
-        except Exception:
-            pass
-    mlflow.log_metrics(metrics)
-    return metrics
+            pr_val = average_precision_score(y_true_bin, y_proba[:, cls_idx])
+        except ValueError:
+            pr_val = 0.0
+        pr_aucs.append(pr_val)
+        weighted_sum += pr_val * (y_true_bin.mean())
+        metrics[f"pr_auc_class_{cls_idx}"] = float(pr_val)
+    metrics["pr_auc_macro"] = float(np.mean(pr_aucs)) if pr_aucs else 0.0
+    metrics["pr_auc_weighted"] = float(weighted_sum) if len(y_true) > 0 else 0.0
 
-
-def plot_and_log_confusion(y_true: np.ndarray, y_pred: np.ndarray, labels: List[int], title: str, artifact_name: str):
     cm = confusion_matrix(y_true, y_pred, labels=labels)
+    return metrics, cm
+
+
+def plot_and_log_confusion(cm: np.ndarray, labels: List[int], title: str, artifact_name: str):
     plt.figure(figsize=(5, 4))
     sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", xticklabels=labels, yticklabels=labels)
     plt.title(title)
@@ -177,124 +208,77 @@ def plot_and_log_confusion(y_true: np.ndarray, y_pred: np.ndarray, labels: List[
 
 
 def run_for_feature_group(
-    df: pd.DataFrame,
     train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
+    test_df: pd.DataFrame,
     group_name: str,
     features: List[str],
+    params: Dict[str, float],
 ):
     print(f"\n=== {group_name} ===")
-    cols = _select_existing_features(df, features)
+    cols = _select_existing_features(train_df, features)
     missing = sorted(set(features) - set(cols))
     mlflow.log_param("feature_group", group_name)
     mlflow.log_param("selected_features_count", len(cols))
     mlflow.log_param("missing_features_count", len(missing))
     if missing:
-        mlflow.log_text("\n".join(missing), "missing_features.txt")
+        mlflow.log_text("\n".join(missing), f"missing_features_{group_name}.txt")
 
-    X_train = _to_numeric(train_df, cols)
-    y_train = train_df[label_col].map({"Not diabetic": 0, "T2D": 1}).astype(int)
+    X_train = _to_numeric(train_df, cols, dataset_tag="train")
+    y_train = train_df[AGG_COL].map(CLASS_TO_ID).astype(int)
 
-    X_val_full = _to_numeric(val_df, cols)
-    y_val_full = val_df[label_col]
-
-    print(f"  Train y_train: {y_train.value_counts().to_dict()}, NaN in X_train: {X_train.isna().sum().sum()}")
-    print(f"  Val full shape: {X_val_full.shape}, y_val_full classes: {y_val_full.value_counts().to_dict()}")
-
-    # Subset of validation with only the two classes for binary metrics
-    val_mask_bin = y_val_full.isin(["T2D", "Not diabetic"])  # boolean mask
-    X_val_bin = X_val_full[val_mask_bin]
-    y_val_bin = y_val_full[val_mask_bin].map({"Not diabetic": 0, "T2D": 1}).astype(int)
-
-    params = {
-        "objective": "binary",
-        "n_estimators": 200,
-        "learning_rate": 0.05,
-        "max_depth": 8,
-        "num_leaves": 31,
-        "min_data_in_leaf": 5,
-        "lambda_l1": 0.1,
-        "lambda_l2": 0.1,
-        "n_jobs": -1,
-        "random_state": 0,
-    }
-    mlflow.log_params(params)
+    X_test = _to_numeric(test_df, cols, dataset_tag="test")
+    y_test = test_df[AGG_COL].map(CLASS_TO_ID).astype(int)
 
     model = LGBMClassifier(**params)
     model.fit(X_train, y_train)
 
-    y_pred_bin = model.predict(X_val_bin)
-    y_proba_bin = model.predict_proba(X_val_bin)[:, 1]
-    print(f"  Train shape: {X_train.shape}, Val bin shape: {X_val_bin.shape}, NaN count in X_val_bin: {X_val_bin.isna().sum().sum()}")
-    evaluate_and_log(y_val_bin.to_numpy(), y_pred_bin, y_proba_bin, feature_group=group_name)
+    y_pred_test = model.predict(X_test)
+    y_proba_test = model.predict_proba(X_test)
+    test_metrics, test_cm = compute_metrics(y_test, y_pred_test, y_proba_test)
+    mlflow.log_metrics({f"test_{k}": v for k, v in test_metrics.items()})
+    mlflow.log_dict({"confusion_matrix": test_cm.tolist()}, f"test_confusion_matrix_{group_name}.json")
 
-    # Evaluate on full validation (includes other classes mapped to 2)
-    y_val_full_mapped = y_val_full.map({"Not diabetic": 0, "T2D": 1}).fillna(2).astype(int)
-    y_pred_full = model.predict(X_val_full)
-    acc_full = float((y_pred_full == y_val_full_mapped).mean())
-    mlflow.log_metric("val_accuracy_full", acc_full)
+    plot_and_log_confusion(test_cm, labels=[0, 1, 2], title=f"Test Confusion - {group_name}", artifact_name=f"cm_test_{group_name}")
+    report = classification_report(y_test, y_pred_test, labels=[0, 1, 2], target_names=[ID_TO_CLASS[i] for i in [0, 1, 2]], digits=4, zero_division=0)
+    mlflow.log_text(report, f"classification_report_test_{group_name}.txt")
 
-    # Confusion matrices
-    plot_and_log_confusion(
-        y_true=y_val_bin.to_numpy(),
-        y_pred=y_pred_bin,
-        labels=[0, 1],
-        title=f"Confusion (Binary) - {group_name}",
-        artifact_name=f"cm_binary_{group_name}",
-    )
-    plot_and_log_confusion(
-        y_true=y_val_full_mapped.to_numpy(),
-        y_pred=y_pred_full,
-        labels=[0, 1, 2],
-        title=f"Confusion (Full) - {group_name}",
-        artifact_name=f"cm_full_{group_name}",
-    )
-
-    # Classification report on full validation
-    report = classification_report(
-        y_val_full_mapped, y_pred_full, labels=[0, 1, 2], digits=4, zero_division=0
-    )
-    mlflow.log_text(report, "classification_report_full.txt")
-
-    # Log model
-    mlflow.lightgbm.log_model(model, name="model")
+    mlflow.lightgbm.log_model(model, name=f"model_{group_name}")
 
 
 def main():
-    # Configure MLflow local tracking
     mlflow.set_tracking_uri("file:./mlruns")
-    experiment_name = "diabetes-feature-groups"
-    mlflow.set_experiment(experiment_name)
+    mlflow.set_experiment("diabetes-feature-groups-multiclass")
 
-    # Load dataset
-    ds = load_dataset("rtweera/nhanes-data-converted", split="train")
-    df = ds.to_pandas()
+    # Load prepared splits (train balanced, test imbalanced)
+    train_df, test_df = load_from_huggingface_or_local()
 
-    # Prepare train/validation per requirements
-    train_df, val_df = prepare_train_val(df, label_col)
+    # Load best hyperparameters from config
+    with open(os.path.join("config", "best_hyperparameters.json"), "r") as f:
+        best_params = json.load(f)
+    best_params.update({"objective": "multiclass", "num_class": 3, "n_jobs": -1, "random_state": 42})
 
-    # Log dataset sizes and class counts
-    with mlflow.start_run(run_name="feature_group_study"):
+    feature_groups: Dict[str, List[str]] = {
+        "blood_serum_labs": blood_serum_labs,
+        "urine_kidney_labs": urine_kidney_labs,
+        "lifestyle_factors": lifestyle_factors,
+        "body_measurements": body_measurements,
+        "pressure_cardio": pressure_cardio,
+        "med_history_comorbidities": med_history_comorbidities,
+        "all_features": all_features,
+    }
+
+    with mlflow.start_run(run_name="feature_group_study_multiclass"):
         mlflow.log_param("train_rows", int(len(train_df)))
-        mlflow.log_param("val_rows", int(len(val_df)))
-        class_counts_train = train_df[label_col].value_counts().to_dict()
-        class_counts_val = val_df[label_col].value_counts().to_dict()
-        mlflow.log_dict(class_counts_train, "train_class_counts.json")
-        mlflow.log_dict(class_counts_val, "val_class_counts.json")
-
-        feature_groups: Dict[str, List[str]] = {
-            "blood_serum_labs": blood_serum_labs,
-            "urine_kidney_labs": urine_kidney_labs,
-            "lifestyle_factors": lifestyle_factors,
-            "body_measurements": body_measurements,
-            "pressure_cardio": pressure_cardio,
-            "med_history_comorbidities": med_history_comorbidities,
-            "all_features": all_features,
-        }
+        mlflow.log_param("test_rows", int(len(test_df)))
+        mlflow.log_dict(train_df[LABEL_COL].value_counts().to_dict(), "train_label_counts.json")
+        mlflow.log_dict(test_df[LABEL_COL].value_counts().to_dict(), "test_label_counts.json")
+        mlflow.log_dict(train_df[AGG_COL].value_counts().to_dict(), "train_label_counts_agg.json")
+        mlflow.log_dict(test_df[AGG_COL].value_counts().to_dict(), "test_label_counts_agg.json")
+        mlflow.log_params({f"best_{k}": v for k, v in best_params.items()})
 
         for group_name, feats in feature_groups.items():
             with mlflow.start_run(nested=True, run_name=group_name):
-                run_for_feature_group(df, train_df, val_df, group_name, feats)
+                run_for_feature_group(train_df, test_df, group_name, feats, best_params)
 
 
 if __name__ == "__main__":
