@@ -192,3 +192,167 @@ flake8 src/ tests/
 ## License
 
 See LICENSE file for details.
+
+## Additional Project Overview
+
+This repository contains an end-to-end machine learning workflow for multiclass diabetes prediction with a focus on:
+
+- Data split design that balances training classes while preserving realistic test distribution
+- LightGBM multiclass modeling
+- Optuna-based hyperparameter search
+- MLflow experiment tracking for metrics, artifacts, and models
+- Feature-group and feature-ablation analysis for interpretability
+
+Target class setup used in modeling:
+
+- `Not diabetic`
+- `T2D`
+- `Other` (aggregated from all non-`T2D` and non-`Not diabetic` labels)
+
+---
+
+## Repository Components (Detailed)
+
+In addition to the structure shown above, these paths are actively used by current scripts:
+
+- `src/data/prepare_diabetes_data.py`
+  - Builds train/test splits
+  - Saves `data/diabetes_train.parquet` and `data/diabetes_test.parquet`
+  - Can load base dataset from Hugging Face (`rtweera/nhanes-data-converted`)
+
+- `src/models/optuna_multiclass_tuning.py`
+  - Runs Optuna tuning for LightGBM
+  - Performs 10-fold stratified CV
+  - Logs trial and final metrics/artifacts to MLflow
+  - Logs final trained model artifact
+
+- `src/models/lifestyle_vs_labs_vs_all.py`
+  - Compares predictive performance across predefined feature groups
+  - Uses best hyperparameters from `config/best_hyperparameters.json`
+  - Logs one nested run per feature group in MLflow
+
+- `src/models/feature_importance_ablation_study.py`
+  - Loads best previously trained model from MLflow
+  - Computes feature importances
+  - Iteratively removes low-importance features (by NaN masking) and evaluates performance
+  - Logs degradation curves and summaries
+
+- `src/models/feature_missingness_plot.py`
+  - Generates a smoothed plot from `reports/feature_missingness_study_results.json`
+  - Saves figure in `reports/`
+
+- `config/best_hyperparameters.json`
+  - Input hyperparameters for feature-group comparison workflow
+
+- `reports/`
+  - Contains generated plots and study outputs, including archived analyses
+
+---
+
+## Recommended End-to-End Workflow
+
+Run scripts from repository root in the order below:
+
+1. Prepare train/test splits:
+
+   ```bash
+   poetry run python -m src.data.prepare_diabetes_data
+   ```
+
+2. Run Optuna tuning + final model training:
+
+   ```bash
+   poetry run python -m src.models.optuna_multiclass_tuning
+   ```
+
+3. Run feature-group comparison study:
+
+   ```bash
+   poetry run python -m src.models.lifestyle_vs_labs_vs_all
+   ```
+
+4. Run feature importance ablation study:
+
+   ```bash
+   poetry run python -m src.models.feature_importance_ablation_study
+   ```
+
+5. Generate missingness/performance smoothing plot:
+
+   ```bash
+   poetry run python -m src.models.feature_missingness_plot
+   ```
+
+6. Open MLflow UI:
+
+   ```bash
+   poetry run mlflow ui
+   ```
+
+---
+
+## MLflow Experiments Used by This Project
+
+Current scripts log to local MLflow tracking and create these experiment names:
+
+- `diabetes-optuna-multiclass`
+  - Hyperparameter tuning trials and final tuned model
+- `diabetes-feature-groups-multiclass`
+  - Feature group performance comparison
+- `diabetes-feature-importance-ablation`
+  - Feature importance and iterative ablation results
+
+Common artifacts logged:
+
+- Confusion matrices (JSON + PNG)
+- Classification reports (TXT)
+- Dataset distribution metadata
+- Non-numeric value diagnostics for converted feature columns
+- Model artifacts (LightGBM via MLflow)
+
+---
+
+## Data and Label Notes
+
+- Primary label column expected by scripts: `Diabetes_Type`
+- Aggregated multiclass label column created/used for modeling: `label_three_class`
+- Scripts select features defensively (only features present in data are used)
+- Non-numeric feature values are coerced to numeric with `NaN` fallback
+
+---
+
+## Environment and Dependency Notes
+
+- The repository is configured with Poetry (`pyproject.toml`).
+- The declared Python version target is `>=3.13,<4.0`.
+- Install dependencies with:
+
+  ```bash
+  poetry install
+  ```
+
+- If Poetry is not available on your machine, install Poetry first and then run project commands through `poetry run ...`.
+
+---
+
+## Troubleshooting
+
+- **`poetry: command not found`**
+  - Install Poetry and ensure it is on your PATH.
+
+- **Missing local split files**
+  - Re-run `src.data.prepare_diabetes_data` to regenerate `data/diabetes_train.parquet` and `data/diabetes_test.parquet`.
+
+- **MLflow experiment or run not found**
+  - Ensure prior workflow steps completed successfully in the same tracking location before running downstream scripts.
+
+- **Feature mismatch between data and script lists**
+  - Scripts already skip unavailable columns; check logged missing-feature artifacts to verify impact.
+
+---
+
+## Reproducibility Notes
+
+- Core scripts use a fixed random seed (`42`) for repeatability.
+- Class balancing in training and distribution-preserving test construction are deterministic given the same inputs and seed.
+- Keep generated artifacts (`data/`, `reports/`, MLflow outputs) under version/control policy appropriate for your environment.
