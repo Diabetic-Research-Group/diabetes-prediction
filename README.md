@@ -2,6 +2,10 @@
 
 Entire codebase for predicting diabetes with labs and lifestyle factors.
 
+## Publication
+
+[Type II Diabetes Risk Prediction: A Multifactor Approach Using Laboratory and Lifestyle Features](https://ieeexplore.ieee.org/document/11499955)
+
 ## Project Structure
 
 ```
